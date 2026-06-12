@@ -1,6 +1,6 @@
 /npm
 /maven
-
+/pypi
 __pycache__/*
 
 __pycache__/

@@ -2,11 +2,68 @@ import os
 import glob
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import xml.etree.ElementTree as ET
 import asyncio
 import json
 import urllib.request
 import re
+
+
+# 전역 캐시 딕셔너리
+OSV_CACHE = {
+    "pypi": {},
+    "npm": {},
+    "maven": {}
+}
+
+def load_offline_data(ecosystem: str, folder_path: str):
+    """
+    폴더 구조나 확장자(JSON/YAML)에 상관없이 OSV 데이터를 읽어 캐시에 적재합니다.
+    """
+    if not os.path.exists(folder_path):
+        print(f"[!] 폴더를 찾을 수 없습니다: {folder_path}")
+        return
+
+    print(f"[*] {ecosystem} 오프라인 데이터 메모리 적재 시작... ({folder_path})")
+    
+    file_count = 0
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            filepath = os.path.join(root, file)
+            data = None
+            try:
+                if file.endswith(".json"):
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                elif file.endswith((".yaml", ".yml")):
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        data = yaml.safe_load(f)
+            except Exception:
+                continue
+
+            if not data:
+                continue
+
+            file_count += 1
+            # 패키지 이름을 추출하여 캐시에 딕셔너리 형태로 분류합니다.
+            for affected in data.get("affected", []):
+                pkg_name = affected.get("package", {}).get("name")
+                if pkg_name:
+                    if pkg_name not in OSV_CACHE[ecosystem]:
+                        OSV_CACHE[ecosystem][pkg_name] = []
+                    OSV_CACHE[ecosystem][pkg_name].append(data)
+
+    print(f"[+] {ecosystem} 메모리 적재 완료! (읽은 파일: {file_count}개, 고유 패키지: {len(OSV_CACHE[ecosystem])}개)")
+# FastAPI Lifespan (서버 켜질 때 딱 한 번 실행)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # npm, maven 폴더의 데이터를 캐시에 로드 (폴더 경로는 실제에 맞게 수정)
+    load_offline_data("npm", "./npm")
+    load_offline_data("maven", "./maven")
+    load_offline_data("pypi", "./pypi")
+    yield
+    # 서버 종료 시 처리할 로직 (필요시)
 
 app = FastAPI()
 
@@ -96,74 +153,75 @@ def _parse_version_string(v_str):
     parts = re.findall(r'\d+', str(v_str))
     return [int(x) for x in parts]
 
-# [신규] 오프라인 스캐닝 핵심 엔진
-def _scan_offline_local(packages, ecosystem_folder):
+# 오프라인 스캐닝 핵심 엔진
+def _scan_offline_local(packages, ecosystem: str):
     """
-    로컬 폴더(npm, maven 등)의 모든 JSON 파일을 읽어 
-    패키지 이름과 버전을 수학적으로 비교하여 매칭합니다.
+    메모리(OSV_CACHE)에 적재된 데이터를 사용하여
+    패키지 이름과 버전을 초고속으로 수학적 비교 매칭합니다.
     """
-    if not os.path.exists(ecosystem_folder):
-        print(f"[!] 로컬 데이터 폴더가 없습니다: {ecosystem_folder}")
+    findings = {pkg["name"]: {"version": pkg["version"], "vulns": []} for pkg in packages}
+
+    # 캐시에 해당 생태계 데이터가 아예 없으면 빈 결과 반환
+    if not OSV_CACHE.get(ecosystem):
+        print(f"[!] {ecosystem} 캐시가 비어있습니다.")
         return []
 
-    # 로컬 JSON 파일 목록 가져오기
-    json_files = glob.glob(os.path.join(ecosystem_folder, "*.json"))
-    
-    findings = {pkg["name"]: {"version": pkg["version"], "vulns": []} for pkg in packages}
-    package_names = set(findings.keys())
+    # 사용자가 업로드한 패키지들만 순회합니다. (전체 파일을 뒤질 필요가 없음!)
+    for pkg in packages:
+        pkg_name = pkg["name"]
+        target_v_str = pkg["version"]
+        target_v = _parse_version_string(target_v_str)
 
-    for filepath in json_files:
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                vuln_data = json.load(f)
-        except Exception:
+        # 🚀 여기서 O(1) 속도로 캐시에서 취약점 목록을 낚아챕니다.
+        cached_vulns = OSV_CACHE[ecosystem].get(pkg_name, [])
+
+        # 캐시에 패키지가 없으면 취약점이 없는 것이므로 패스
+        if not cached_vulns:
             continue
 
-        vuln_id = vuln_data.get("id", "Unknown")
-        aliases = vuln_data.get("aliases", [])
-        summary = vuln_data.get("summary", vuln_data.get("details", "요약 없음"))
+        for vuln_data in cached_vulns:
+            vuln_id = vuln_data.get("id", "Unknown")
+            aliases = vuln_data.get("aliases", [])
+            summary = vuln_data.get("summary", vuln_data.get("details", "요약 없음"))
 
-        for affected in vuln_data.get("affected", []):
-            pkg_name = affected.get("package", {}).get("name")
-            if pkg_name not in package_names:
-                continue
+            for affected in vuln_data.get("affected", []):
+                # 캐시에서 가져왔으므로 이름 비교는 생략 가능하지만 2중 안전장치로 유지
+                if affected.get("package", {}).get("name") != pkg_name:
+                    continue
 
-            # 패키지 이름이 일치하면, 버전이 취약 범위(ranges)에 들어가는지 검사
-            target_v_str = findings[pkg_name]["version"]
-            target_v = _parse_version_string(target_v_str)
-            is_vulnerable = False
+                is_vulnerable = False
 
-            # 1. Exact version match 확인
-            if target_v_str in affected.get("versions", []):
-                is_vulnerable = True
+                # 1. Exact version match 확인
+                if target_v_str in affected.get("versions", []):
+                    is_vulnerable = True
 
-            # 2. Ranges (introduced ~ fixed) 확인
-            for r in affected.get("ranges", []):
-                if is_vulnerable: break
-                
-                introduced = None
-                fixed = None
-                
-                for event in r.get("events", []):
-                    if "introduced" in event:
-                        introduced = _parse_version_string(event["introduced"] if event["introduced"] != "0" else "0.0.0")
-                    if "fixed" in event:
-                        fixed = _parse_version_string(event["fixed"])
+                # 2. Ranges (introduced ~ fixed) 확인
+                for r in affected.get("ranges", []):
+                    if is_vulnerable: break
+                    
+                    introduced = None
+                    fixed = None
+                    
+                    for event in r.get("events", []):
+                        if "introduced" in event:
+                            introduced = _parse_version_string(event["introduced"] if event["introduced"] != "0" else "0.0.0")
+                        if "fixed" in event:
+                            fixed = _parse_version_string(event["fixed"])
 
-                if introduced and not fixed:
-                    if target_v >= introduced:
-                        is_vulnerable = True
-                elif introduced and fixed:
-                    if target_v >= introduced and target_v < fixed:
-                        is_vulnerable = True
+                    if introduced and not fixed:
+                        if target_v >= introduced:
+                            is_vulnerable = True
+                    elif introduced and fixed:
+                        if target_v >= introduced and target_v < fixed:
+                            is_vulnerable = True
 
-            # 취약점으로 판별되면 결과 리스트에 추가
-            if is_vulnerable:
-                findings[pkg_name]["vulns"].append({
-                    "id": vuln_id,
-                    "aliases": aliases,
-                    "summary": summary[:200] + "..." if len(summary) > 200 else summary # 너무 길면 자름
-                })
+                # 취약점으로 판별되면 결과 리스트에 추가
+                if is_vulnerable:
+                    findings[pkg_name]["vulns"].append({
+                        "id": vuln_id,
+                        "aliases": aliases,
+                        "summary": summary[:200] + "..." if len(summary) > 200 else summary
+                    })
 
     # 프론트엔드 포맷으로 변환
     results = []
