@@ -8,62 +8,62 @@ import asyncio
 import json
 import urllib.request
 import re
+import yaml
+import sqlite3
+# # 전역 캐시 딕셔너리
+# OSV_CACHE = {
+#     "pypi": {},
+#     "npm": {},
+#     "maven": {}
+# }
 
+# def load_offline_data(ecosystem: str, folder_path: str):
+#     """
+#     폴더 구조나 확장자(JSON/YAML)에 상관없이 OSV 데이터를 읽어 캐시에 적재합니다.
+#     """
+#     if not os.path.exists(folder_path):
+#         print(f"[!] 폴더를 찾을 수 없습니다: {folder_path}")
+#         return
 
-# 전역 캐시 딕셔너리
-OSV_CACHE = {
-    "pypi": {},
-    "npm": {},
-    "maven": {}
-}
-
-def load_offline_data(ecosystem: str, folder_path: str):
-    """
-    폴더 구조나 확장자(JSON/YAML)에 상관없이 OSV 데이터를 읽어 캐시에 적재합니다.
-    """
-    if not os.path.exists(folder_path):
-        print(f"[!] 폴더를 찾을 수 없습니다: {folder_path}")
-        return
-
-    print(f"[*] {ecosystem} 오프라인 데이터 메모리 적재 시작... ({folder_path})")
+#     print(f"[*] {ecosystem} 오프라인 데이터 메모리 적재 시작... ({folder_path})")
     
-    file_count = 0
-    for root, dirs, files in os.walk(folder_path):
-        for file in files:
-            filepath = os.path.join(root, file)
-            data = None
-            try:
-                if file.endswith(".json"):
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                elif file.endswith((".yaml", ".yml")):
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        data = yaml.safe_load(f)
-            except Exception:
-                continue
+#     file_count = 0
+#     for root, dirs, files in os.walk(folder_path):
+#         for file in files:
+#             filepath = os.path.join(root, file)
+#             data = None
+#             try:
+#                 if file.endswith(".json"):
+#                     with open(filepath, 'r', encoding='utf-8') as f:
+#                         data = json.load(f)
+#                 elif file.endswith((".yaml", ".yml")):
+#                     with open(filepath, 'r', encoding='utf-8') as f:
+#                         data = yaml.safe_load(f)
+#             except Exception:
+#                 continue
 
-            if not data:
-                continue
+#             if not data:
+#                 continue
 
-            file_count += 1
-            # 패키지 이름을 추출하여 캐시에 딕셔너리 형태로 분류합니다.
-            for affected in data.get("affected", []):
-                pkg_name = affected.get("package", {}).get("name")
-                if pkg_name:
-                    if pkg_name not in OSV_CACHE[ecosystem]:
-                        OSV_CACHE[ecosystem][pkg_name] = []
-                    OSV_CACHE[ecosystem][pkg_name].append(data)
+#             file_count += 1
+#             # 패키지 이름을 추출하여 캐시에 딕셔너리 형태로 분류합니다.
+#             for affected in data.get("affected", []):
+#                 pkg_name = affected.get("package", {}).get("name")
+#                 if pkg_name:
+#                     if pkg_name not in OSV_CACHE[ecosystem]:
+#                         OSV_CACHE[ecosystem][pkg_name] = []
+#                     OSV_CACHE[ecosystem][pkg_name].append(data)
 
-    print(f"[+] {ecosystem} 메모리 적재 완료! (읽은 파일: {file_count}개, 고유 패키지: {len(OSV_CACHE[ecosystem])}개)")
-# FastAPI Lifespan (서버 켜질 때 딱 한 번 실행)
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # npm, maven 폴더의 데이터를 캐시에 로드 (폴더 경로는 실제에 맞게 수정)
-    load_offline_data("npm", "./npm")
-    load_offline_data("maven", "./maven")
-    load_offline_data("pypi", "./pypi")
-    yield
-    # 서버 종료 시 처리할 로직 (필요시)
+#     print(f"[+] {ecosystem} 메모리 적재 완료! (읽은 파일: {file_count}개, 고유 패키지: {len(OSV_CACHE[ecosystem])}개)")
+# # FastAPI Lifespan (서버 켜질 때 딱 한 번 실행)
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     # npm, maven 폴더의 데이터를 캐시에 로드 (폴더 경로는 실제에 맞게 수정)
+#     load_offline_data("npm", "./npm")
+#     load_offline_data("maven", "./maven")
+#     load_offline_data("pypi", "./pypi")
+#     yield
+#     # 서버 종료 시 처리할 로직 (필요시)
 
 app = FastAPI()
 
@@ -153,6 +153,35 @@ def _parse_version_string(v_str):
     parts = re.findall(r'\d+', str(v_str))
     return [int(x) for x in parts]
 
+# main.py에서 수정할 부분
+def get_vulns_from_db(ecosystem, pkg_name):
+    conn = sqlite3.connect("osv_cache.db")
+    cursor = conn.cursor()
+    # 쿼리 실행
+    cursor.execute(
+        "SELECT vuln_data FROM osv_data WHERE ecosystem = ? AND package_name = ?",
+        (ecosystem, pkg_name)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    
+    # DB에서 가져온 JSON 문자열을 리스트로 변환
+    return [json.loads(row[0]) for row in rows]
+
+def get_vulns_from_db(ecosystem, pkg_name):
+    conn = sqlite3.connect("osv_cache.db")
+    cursor = conn.cursor()
+    # 쿼리 실행
+    cursor.execute(
+        "SELECT vuln_data FROM osv_data WHERE ecosystem = ? AND package_name = ?",
+        (ecosystem, pkg_name)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    
+    # DB에서 가져온 JSON 문자열을 리스트로 변환
+    return [json.loads(row[0]) for row in rows]
+
 # 오프라인 스캐닝 핵심 엔진
 def _scan_offline_local(packages, ecosystem: str):
     """
@@ -161,10 +190,6 @@ def _scan_offline_local(packages, ecosystem: str):
     """
     findings = {pkg["name"]: {"version": pkg["version"], "vulns": []} for pkg in packages}
 
-    # 캐시에 해당 생태계 데이터가 아예 없으면 빈 결과 반환
-    if not OSV_CACHE.get(ecosystem):
-        print(f"[!] {ecosystem} 캐시가 비어있습니다.")
-        return []
 
     # 사용자가 업로드한 패키지들만 순회합니다. (전체 파일을 뒤질 필요가 없음!)
     for pkg in packages:
@@ -173,7 +198,7 @@ def _scan_offline_local(packages, ecosystem: str):
         target_v = _parse_version_string(target_v_str)
 
         # 🚀 여기서 O(1) 속도로 캐시에서 취약점 목록을 낚아챕니다.
-        cached_vulns = OSV_CACHE[ecosystem].get(pkg_name, [])
+        cached_vulns = get_vulns_from_db(ecosystem, pkg_name)
 
         # 캐시에 패키지가 없으면 취약점이 없는 것이므로 패스
         if not cached_vulns:
